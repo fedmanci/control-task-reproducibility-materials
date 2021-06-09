@@ -1,0 +1,308 @@
+---
+title: "Reproducibility materials."
+output: html_notebook
+---
+This is a step-by-step guide to reproducing the paper figures.
+
+```{r}
+
+require(rmatio)
+
+# set working directory to source location (this line only works if you use RStudio!)
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+
+dgts <- readRDS("./task_data/dgts.rds")
+sgts <- readRDS("./task_data/sgts.rds")
+
+n_subjects = 35
+questionnaires = read.mat("./task_data/questionnaire_scores.mat")
+questionnaires = as.data.frame(questionnaires$qMatrix)
+names(questionnaires) = c('I-score', 'C-score', 'P-score');
+
+```
+
+First (above) we load the *.rds* files containing the pre-confectioned DGT, SGT data, and questionnaire scores into R.
+
+```{r}
+require(rstan)
+
+the.posterior <- stan(
+  file = './DGT_models/vehicle_dep_rw.stan',  # Stan program that can be found in the DGT/SGT_models folders
+  data = dgts,         # named list of data (dgts for double goal trials, sgts for single goal trials)
+  chains = 6,          # number of Markov chains
+  warmup = 2000,       # number of warmup iterations per chain
+  iter = 3000,         # total number of iterations per chain
+  cores = 6,           # number of cores (could use one per chain)
+  control = list(adapt_delta = 0.99999999, max_treedepth = 11)
+)
+
+# computation of waic scores
+log_likelihoods = rstan::extract(the.posterior, 'log_lik');
+waic(log_likelihoods[['log_lik']])
+
+```
+Models can be fit using the snippet above. To run *any* model, it will suffice to provide rstan with the corresponding .stan file. All model files are in the DGT_models and SGT_models folders. To run any model, only edit *the file and data fields*. The data field should change wrt whether you are running dgts or sgts models. Posterior samples for dgts will be contained in the.posterior. They are extracted automatically in the snippet below.
+
+```{r}
+
+require('pracma')
+
+## ~ ~ ~ ~ ~ Extract posterior means for model 'vehicle_dep_rw'. ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~
+## ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~
+
+posterior_means.df = data.frame(matrix(ncol = 0, nrow = n_subjects))
+
+# this is the parameter list for model 'vehicle_dep_rw'.
+param.list = c('dst_par','veh_par','rew_par','lr_par_w','lr_par_l','mf_par','pr_par', 'ach_g2');
+
+for (par in param.list){
+  
+  temp <- rstan::extract(the.posterior, pars = par);
+  means <- colMeans(temp[[par]]);
+
+  if (strcmp(par,'ach_g2')){
+    # the values below are *necessary* to obtain plots in figure 6
+    ach.1 =  (dgts$block_type == 1) * means[,1,1] + (dgts$block_type == 2) * means[,1,2];
+    ach.2 =  (dgts$block_type == 1) * means[,2,1] + (dgts$block_type == 2) * means[,2,2];
+  }
+  else if (strcmp(par,'lr_par_w')){
+    posterior_means.df$hi.win.lr <- means;
+  }
+  else if (strcmp(par,'lr_par_l')){
+    posterior_means.df$hi.los.lr <- means[,1];
+    posterior_means.df$lo.los.lr <- means[,2];
+  }
+  else{
+      posterior_means.df[[paste0('hi.',par)]] <- means[,1];
+      posterior_means.df[[paste0('lo.',par)]] <- means[,2];
+  }
+}
+
+rm(list = c('temp','means'))
+
+## ~ ~ ~ ~ ~ Extract posterior means for interaction model in SGTs ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~
+## ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~
+
+temp <- rstan::extract(the.posterior, pars = 'dist_par');
+sgt_distance <- colMeans(temp$dist_par); rm(temp)
+temp <- rstan::extract(fit.Ach, pars = 'inter_par');
+sgt_interaction <- colMeans(temp$inter_par); rm(temp)
+temp <- rstan::extract(fit.Ach, pars = 'veh_par');
+sgt_guidability <- colMeans(temp$veh_par); rm(temp)
+temp <- rstan::extract(fit.Ach, pars = 'ach_par');
+sgt_achievability <- colMeans(temp$ach_par); rm(temp)
+
+rm(list = c('temp','means'))
+
+```
+Once 'vehicle_dep_rw' model has been run, samples from the posterior can be averaged across chains to obtain MC estimates
+of the posterior means for each parameter. The upper section of this snippet extracts and averages parameter estimates from the posterior (e.g. 'the.posterior' above). It will yield a 'posterior_means.df' data frame. Note that there is also a section for extraction of parameters if 'the.posterior' contains samples from the sgt model 'interaction' (winning model).
+
+```{r}
+
+require(rmatio)
+require(pracma)
+require(tidyverse)
+
+# import trial data matrix into a dataframe --> trials.df
+trialdata = read.mat('./task_data/trialdata.mat');
+trials.df = as.data.frame(trialdata$allSubjects); rm('trialdata')
+
+names(trials.df) = c('sub','t.no','b.no','v1','v2','g1','g2','d.v1g1','d.v1g2','d.v2g1','d.v2g2','rot.X','rot.Y',
+                     'b.type','outcome','v.choice','g.choice','RT','last.press','avg.freq','tot.press','eff.press',
+                     'err.press','n1','n2','n3','n4','n5','n6','n7','n8','n9','n10','n11','n12','n13','t.type','n15','b.no.cond');
+trials.df$t.no.mod20 = trials.df$t.no %% 20;
+
+# exclude SGTs (column 37 identifies trial type, trial type 4 identifies SGTs)
+dgtdata <- as.data.frame(subset(trials.df, (trials.df$t.type < 4)));
+
+# t.no.cond := trial number within influence condition.
+dgtdata$t.no.cond = 0;
+for (t in 1:dim(dgtdata)[1]) {
+  dgtdata[t,]$t.no.cond = (dgtdata[t,]$b.no.cond-1)*16 + dgtdata[t,]$t.no.mod20; 
+}
+
+#  - - - - - - - -
+#  - - - - - - - -
+
+# augment dgtdata with 3 more columns.
+# $internal : 1 if internal; -1 if not
+# $I.score : I-score.
+# quantile of I score
+
+questionnaires$I.quantile = 0;
+questionnaires$I.quantile = ntile(questionnaires$`I-score`, 3);
+
+dgtdata$internal = rep(NA,dim(dgtdata)[1]);
+dgtdata$I.score = rep(NA,dim(dgtdata)[1]);
+dgtdata$I.quantile = rep(NA,dim(dgtdata)[1]);
+
+for (s in 1:n_subjects) {
+  if (questionnaires$`I-score`[s] > median(questionnaires$`I-score`) ){
+    dgtdata[dgtdata$sub == s,]$internal = 'High I-score';
+  }
+  if (questionnaires$`I-score`[s] < median(questionnaires$`I-score`) ){
+    dgtdata[dgtdata$sub == s,]$internal = 'Low I-score';
+  }
+  dgtdata[dgtdata$sub == s,]$I.score = questionnaires[s,]$`I-score`;
+  dgtdata[dgtdata$sub == s,]$I.quantile = questionnaires[s,]$`I.quantile`;
+}
+
+
+require(ggplot2)
+
+ach.1 = subset(ach.1, dgtdata$t.no.mod20 < 16 & !is.na(dgtdata$internal))
+ach.2 = subset(ach.2, dgtdata$t.no.mod20 < 16 & !is.na(dgtdata$internal))
+fig6 = ggplot(subset(dgtdata, t.no.mod20 < 16 & !is.na(internal)), aes(x = t.no.cond, y = (ach.1/2 + ach.2/2))) + geom_smooth(aes(color = as.factor(internal), fill = as.factor(internal))) +
+  facet_wrap(~b.type, labeller = labeller(b.type = c("125" = "High influence", "250" = "Low influence"))) +
+  theme(legend.title=element_blank()) + ylab('Average achievability') + xlab('Trial number') + theme(text = element_text(size=22));
+
+# plot Figure 6 A1 and A2
+fig6
+
+```
+Above code: figure 6 in paper, insets A1 and A2 - i.e. the evolution of perceived achievability throughout the task.
+
+```{r}
+
+require(ggplot2)
+
+# figure 6, insets:
+# B1
+fig6.B1 = ggplot(posterior_means.df, aes(x = questionnaires$`I-score`, y = hi.learn_Loss)) + geom_point()
+# B2
+fig6.B2 = ggplot(posterior_means.df, aes(x = questionnaires$`I-score`, y = lo.learn_Loss)) + geom_point()
+
+# the correlations shown in figure should be roughly the same as the ones you obtain below:
+# B1
+corr.test(questionnaires$`I-score`, posterior_means.df$hi.learn_Loss)
+# B2
+corr.test(questionnaires$`I-score`, posterior_means.df$lo.learn_Loss)
+
+```
+Above code: figure 6 in paper, insets B1 and B2 - i.e. the relationship between I-scores and learning rates from losses.
+
+```{r}
+
+require(psych)
+
+# first inset (A1): correlation coefficients. Will suffice to simply execute a call to corr.test (from 'psych').
+
+# high influence correalations - Holmes-Bonferroni corrected.
+ctest.hi = corr.test(questionnaires$`I-score`, posterior_means.df[,c(1,3,5,7,8,10,12)], adjust = 'BH')
+# low influence correalations - Holmes-Bonferroni corrected.
+ctest.lo = corr.test(questionnaires$`I-score`, posterior_means.df[,c(2,4,6,9,11,13)], adjust = 'BH')
+
+model.pars = c("Distance sensitivity", "Guidability sensitivity", 'Reward sensitivity',
+               'Learning (gain)', "H_1", 'Learning rate (success)',
+               'Learning rate (failure)');
+
+hi.ccs = ctest.hi$r[c(1,2,3,7,6,4,5)];
+lo.ccs = c(ctest.lo$r[c(1,2,3,6,5)],'N/A',ctest.lo$r[4]);
+
+effect.sizes = data.frame(hi.ccs, lo.ccs, model.pars);
+effect.sizes <- melt(effect.sizes, id.vars='model.pars');
+
+fig7.A1 = ggplot(effect.sizes, aes(x=factor(model.pars), y=as.numeric(value), fill=variable)) +
+  geom_bar(color = "black", width = 0.45,alpha = 0.35, stat='identity', position='dodge', na.rm = T) + coord_flip() + 
+  ylim(-0.6,0.6) + ylab("I-score correlation coefficient") +
+  theme(legend.title = element_blank(), text = element_text(size=25)) +
+  scale_fill_manual(values = c("black","blue"))  +
+  scale_x_discrete(limits = rev(model.pars),
+                   "Parameters", 
+                   labels = rev(c(model.pars[1:4],expression(paste("Learning (","H"[1],")")),model.pars[6:7])));
+
+# plot Figure 7 A1
+fig7.A1
+
+# second inset (A2): see MatLab code for permutative importance measures of parameters for effect found.
+
+# third inset (A3): random forest prediction of I-scores from mean parameters recovered.
+
+require(party)
+require(MLmetrics)
+require(tidyverse)
+require(randomForest)
+require(caret)
+require(reshape)
+
+posterior_means.df$`I-score` = questionnaires$`I-score`;
+cond.imp = matrix(nrow = 50, ncol = 13)
+for (i in 1:50){
+  cond.for <- cforest(
+    `I-score` ~ .,
+    data = posterior_means.df,
+    control = cforest_unbiased(mtry = 4, ntree = 1000),
+  )
+  cond.imp[i,] = varImp::varImp(cond.for, conditional = TRUE, measure = 'MSE');  
+}
+
+vi.means = colMeans(cond.imp);
+vi.stds = apply(cond.imp,2,sd);
+
+hi.vi.means = vi[c(1,3,5,12,10,7,8)];
+lo.vi.means = c(vi[c(2,4,6,13,11)],'N/A',vi[9]);
+
+hi.vi.stds= vi.stds[c(1,3,5,12,10,7,8)];
+lo.vi.stds = c(vi.stds[c(2,4,6,13,11)],'N/A',vi.stds[9]);
+
+model.pars = c("Distance sensitivity", "Guidability sensitivity", 'Reward sensitivity',
+               'Learning (gain)', "H_1", 'Learning rate (success)',
+               'Learning rate (failure)');
+
+predictiveness.df = data.frame(hi.vi.means, lo.vi.means, model.pars);
+predictiveness.df <- melt(predictiveness.df, id.vars='model.pars');
+predictiveness.df$stderr <- c(hi.vi.stds, lo.vi.stds);
+
+## PLOT of figure 7 inset A3.
+fig7.A3 = ggplot(predictiveness.df, aes(x=factor(model.pars), y=as.numeric(value), fill=variable)) +
+  geom_bar(color = "black", 
+           width = 0.5,
+           alpha = 0.35, stat='identity', position='dodge', na.rm = T) +
+  coord_flip() +
+  geom_linerange(aes(x=factor(model.pars),
+                    ymin=as.numeric(value)-as.numeric(stderr), 
+                    ymax=as.numeric(value)+as.numeric(stderr)), width=0.4, 
+                    position = position_dodge(width = 0.5), 
+                    colour="red", alpha=0.9, size=1, na.rm = T ) +
+  coord_flip() + 
+  ylim(-1,5) + ylab("Importance (I-score prediction)") +
+  theme(legend.title = element_blank(), text = element_text(size=25)) +
+  scale_fill_manual(values = c("black","blue"))  +
+  scale_x_discrete(limits = rev(model.pars),
+                   "Parameters", 
+                   labels = rev(c(model.pars[1:4],expression(paste("Learning (","H"[1],")")),model.pars[6:7])));
+
+# plot Figure 7 A3
+fig7.A3
+```
+Above code: figure 7 in paper - all 3 insets.
+
+```{r}
+
+require(psych)
+
+# Number losses
+nlosses = read.mat('./task_data/nlosses.mat');
+nlosses = nlosses$los;
+
+# Moneys earned
+moneys = read.mat('./task_data/moneys.mat');
+moneys = moneys$rz;
+
+# figure 8, insets:
+# B1
+fig8.A1 = ggplot(questionnaires, aes(`P-score`, y = moneys[,2])) + geom_point()
+# B2
+fig8.A2 = ggplot(questionnaires, aes(`P-score`, y = nlosses[,2])) + geom_point()
+
+# the correlations shown in figure should be roughly the same as the ones you obtain below:
+# A1
+corr.test(questionnaires$`P-score`, moneys[,2])
+# A2
+corr.test(questionnaires$`P-score`, nlosses[,2])
+```
+Above code: figure 8 in paper - correlations between P-scores and money amounts won and number of losses.
+
+
+
